@@ -79,6 +79,8 @@ def get_db():
 def init_db():
     conn = get_db()
     c = conn.cursor()
+    
+    # Create tables if not exists
     c.executescript("""
     CREATE TABLE IF NOT EXISTS force_channels (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,41 +98,12 @@ def init_db():
         is_sold INTEGER DEFAULT 0, sold_to INTEGER, sold_at TIMESTAMP,
         added_by INTEGER, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, username TEXT, account_id INTEGER,
-        category_id INTEGER, category_name TEXT,
-        amount_inr REAL, amount_usd REAL,
-        payment_method TEXT DEFAULT 'upi',
-        payment_screenshot TEXT,
-        utr_number TEXT,
-        crypto_track_id TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        reviewed_by INTEGER, reviewed_at TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS used_utrs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        utr_number TEXT UNIQUE NOT NULL,
-        used_by INTEGER,
-        used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
         is_banned INTEGER DEFAULT 0, total_purchases INTEGER DEFAULT 0,
         wallet_balance REAL DEFAULT 0,
         joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         referred_by INTEGER
-    );
-    CREATE TABLE IF NOT EXISTS deposits (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, amount_inr REAL, amount_usd REAL,
-        payment_method TEXT DEFAULT 'upi',
-        screenshot TEXT, utr_number TEXT,
-        crypto_track_id TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        reviewed_by INTEGER, reviewed_at TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY, value TEXT
@@ -154,6 +127,91 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users(id)
     );
     """)
+    
+    # ═══ MIGRATION: Add new columns if they don't exist (no data loss) ═══
+    
+    # orders table - add transaction_id column if missing
+    try:
+        c.execute("ALTER TABLE orders ADD COLUMN transaction_id TEXT")
+        logger.info("✅ Added transaction_id column to orders")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
+    # deposits table - add transaction_id column if missing
+    try:
+        c.execute("ALTER TABLE deposits ADD COLUMN transaction_id TEXT")
+        logger.info("✅ Added transaction_id column to deposits")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
+    # Create orders table if not exists
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, username TEXT, account_id INTEGER,
+        category_id INTEGER, category_name TEXT,
+        amount_inr REAL, amount_usd REAL,
+        payment_method TEXT DEFAULT 'upi',
+        payment_screenshot TEXT,
+        utr_number TEXT,
+        transaction_id TEXT,
+        crypto_track_id TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        reviewed_by INTEGER, reviewed_at TIMESTAMP
+    )
+    """)
+    
+    # Create deposits table if not exists
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS deposits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, amount_inr REAL, amount_usd REAL,
+        payment_method TEXT DEFAULT 'upi',
+        screenshot TEXT, utr_number TEXT, transaction_id TEXT,
+        crypto_track_id TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        reviewed_by INTEGER, reviewed_at TIMESTAMP
+    )
+    """)
+    
+    # Drop old used_utrs table and recreate with new schema
+    # First, backup old data if table exists
+    old_utrs_data = []
+    try:
+        old_rows = c.execute("SELECT utr_number, used_by, used_at FROM used_utrs").fetchall()
+        for row in old_rows:
+            old_utrs_data.append((row["utr_number"], row["used_by"], row["used_at"]))
+        logger.info(f"📦 Backed up {len(old_utrs_data)} old UTR records")
+    except sqlite3.OperationalError:
+        pass  # Old table doesn't exist or has different schema
+    
+    # Drop and recreate used_utrs with new schema
+    c.execute("DROP TABLE IF EXISTS used_utrs")
+    c.execute("""
+    CREATE TABLE used_utrs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        utr_number TEXT,
+        transaction_id TEXT,
+        used_by INTEGER,
+        used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_used_utrs_utr ON used_utrs(utr_number)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_used_utrs_txn ON used_utrs(transaction_id)")
+    
+    # Restore old UTR data (transaction_id will be NULL for old records)
+    for utr, used_by, used_at in old_utrs_data:
+        try:
+            c.execute(
+                "INSERT INTO used_utrs (utr_number, transaction_id, used_by, used_at) VALUES (?, NULL, ?, ?)",
+                (utr, used_by, used_at)
+            )
+        except Exception as e:
+            logger.error(f"Failed to restore UTR {utr}: {e}")
+    
+    # Insert default settings
     for k, v in [
         ("maintenance",     "0"),
         ("upi_enabled",     "1"),
@@ -162,8 +220,10 @@ def init_db():
         ("welcome_message", "🏪 Welcome to NumberStore!\nBuy verified phone numbers instantly.\nFast • Secure • 24/7"),
     ]:
         c.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (k, v))
+    
     conn.commit()
     conn.close()
+    logger.info("✅ Database initialization complete (no data loss)")
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -231,19 +291,36 @@ def is_maintenance():
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-def is_utr_used(utr):
+def is_payment_used(utr=None, transaction_id=None):
+    """Check if either UTR or Transaction ID has already been used."""
+    if not utr and not transaction_id:
+        return False
     conn = get_db()
-    row = conn.execute("SELECT id FROM used_utrs WHERE utr_number=?", (utr,)).fetchone()
+    found = False
+    if utr:
+        row = conn.execute("SELECT id FROM used_utrs WHERE utr_number=?", (utr,)).fetchone()
+        if row:
+            found = True
+    if not found and transaction_id:
+        row = conn.execute("SELECT id FROM used_utrs WHERE transaction_id=?", (transaction_id,)).fetchone()
+        if row:
+            found = True
     conn.close()
-    return row is not None
+    return found
 
-def mark_utr_used(utr, user_id):
+def mark_payment_used(utr, transaction_id, user_id):
+    """Save BOTH UTR and Transaction ID so neither can be reused."""
+    if not utr and not transaction_id:
+        return
     conn = get_db()
     try:
-        conn.execute("INSERT INTO used_utrs (utr_number, used_by) VALUES (?,?)", (utr, user_id))
+        conn.execute(
+            "INSERT INTO used_utrs (utr_number, transaction_id, used_by) VALUES (?,?,?)",
+            (utr, transaction_id, user_id)
+        )
         conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+    except Exception as e:
+        logger.error(f"mark_payment_used error: {e}")
     conn.close()
 
 def status_emoji(s):
@@ -286,31 +363,36 @@ def generate_referral_link(user_id):
     return f"https://t.me/{STORE_TAG.lstrip('@')}?start=ref_{user_id}"
 
 
-# ─── GMAIL AUTO-APPROVAL ────────────────────────────────────────────────────
-def check_gmail_for_payment(amount_inr, utr_number, minutes=60):
+# ─── GMAIL AUTO-APPROVAL (DUAL UTR+TXN SAVE) ────────────────────────────────
+def check_gmail_for_payment(amount_inr, search_value, minutes=60):
     """
     Gmail inbox check karta hai last `minutes` ke emails mein
     FamApp se aaye payment confirmation email ke andar
     amount aur UTR/Transaction ID match karta hai.
-    Returns True if match found, False otherwise.
+    
+    Returns: (True, extracted_utr, extracted_transaction_id) if match found
+             (False, None, None) otherwise
     """
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(GMAIL_USER, GMAIL_APP_PASS)
         mail.select("inbox")
 
-        # Search emails from FamApp in last X minutes
         since_time = (datetime.now() - timedelta(minutes=minutes)).strftime("%d-%b-%Y")
         search_criteria = f'(FROM "no-reply@famapp.in" SINCE "{since_time}")'
         status, messages = mail.search(None, search_criteria)
 
         if status != "OK" or not messages[0]:
             mail.logout()
-            return False
+            return False, None, None
 
         email_ids = messages[0].split()
-        # Check latest emails first (reverse order)
-        for eid in reversed(email_ids[-20:]):  # Check last 20 emails max
+        
+        if not search_value:
+            mail.logout()
+            return False, None, None
+
+        for eid in reversed(email_ids[-20:]):
             status, msg_data = mail.fetch(eid, "(RFC822)")
             if status != "OK":
                 continue
@@ -341,11 +423,10 @@ def check_gmail_for_payment(amount_inr, utr_number, minutes=60):
                         except:
                             pass
 
-                    # Clean HTML tags for text search
                     body_clean = re.sub(r'<[^>]+>', ' ', body)
-                    full_text = f"{subject} {body_clean}".lower()
+                    full_text = f"{subject} {body_clean}"
 
-                    # Check amount (₹XX format ya XX.XX format)
+                    # Check amount
                     amount_str = str(int(amount_inr))
                     amount_patterns = [
                         f"₹{amount_str}",
@@ -360,29 +441,88 @@ def check_gmail_for_payment(amount_inr, utr_number, minutes=60):
 
                     amount_found = False
                     for pat in amount_patterns:
-                        if pat.lower() in full_text:
+                        if pat.lower() in full_text.lower():
                             amount_found = True
                             break
 
-                    # Check UTR/Transaction ID
-                    utr_found = utr_number.lower() in full_text
+                    if not amount_found:
+                        continue
 
-                    if amount_found and utr_found:
-                        mail.logout()
-                        logger.info(f"✅ Gmail auto-match: Amount=₹{amount_inr}, UTR={utr_number}")
-                        return True
+                    # Check if search_value matches (UTR or Transaction ID)
+                    search_found = search_value.lower() in full_text.lower()
+                    if not search_found:
+                        continue
+
+                    # ── EXTRACT BOTH UTR AND TRANSACTION ID FROM EMAIL ──
+                    extracted_utr = None
+                    extracted_txn = None
+
+                    # Extract UTR (numeric, usually 10-16 digits)
+                    utr_patterns = [
+                        r'UTR\s*:?\s*(\d{10,16})',
+                        r'UTR\s*Number\s*:?\s*(\d{10,16})',
+                        r'Reference\s*ID\s*:?\s*(\d{10,16})',
+                    ]
+                    for pat in utr_patterns:
+                        match = re.search(pat, full_text, re.IGNORECASE)
+                        if match:
+                            extracted_utr = match.group(1).strip()
+                            break
+
+                    # If UTR not found by label, try to find numeric value after "UTR :"
+                    if not extracted_utr:
+                        match = re.search(r'UTR\s*:?\s*(\d[\d\s]{8,18})', full_text, re.IGNORECASE)
+                        if match:
+                            extracted_utr = re.sub(r'\s+', '', match.group(1))
+
+                    # Extract Transaction ID (alphanumeric, e.g., FMPIB5352552758)
+                    txn_patterns = [
+                        r'Transaction\s*ID\s*:?\s*([A-Za-z0-9]{8,30})',
+                        r'Transaction\s*Number\s*:?\s*([A-Za-z0-9]{8,30})',
+                        r'Transaction\s*:?\s*([A-Za-z0-9]{8,30})',
+                        r'TXN\s*:?\s*([A-Za-z0-9]{8,30})',
+                    ]
+                    for pat in txn_patterns:
+                        match = re.search(pat, full_text, re.IGNORECASE)
+                        if match:
+                            extracted_txn = match.group(1).strip().upper()
+                            break
+
+                    # If still not found, look for FMPIB pattern (FamApp specific)
+                    if not extracted_txn:
+                        match = re.search(r'(FMPIB\d{8,20})', full_text, re.IGNORECASE)
+                        if match:
+                            extracted_txn = match.group(1).strip().upper()
+
+                    # Also extract numeric transaction ID if UTR was found but no TXN ID
+                    if not extracted_txn:
+                        match = re.search(r'Transaction\s*(?:ID|Number)?\s*:?\s*(\d{8,20})', full_text, re.IGNORECASE)
+                        if match:
+                            extracted_txn = match.group(1).strip()
+
+                    # Clean up - remove spaces
+                    if extracted_utr:
+                        extracted_utr = re.sub(r'\s+', '', extracted_utr)
+                    if extracted_txn:
+                        extracted_txn = re.sub(r'\s+', '', extracted_txn)
+
+                    mail.logout()
+                    logger.info(f"✅ Gmail auto-match: Amount=₹{amount_inr}, UTR={extracted_utr}, TXN={extracted_txn}")
+                    return True, extracted_utr, extracted_txn
 
         mail.logout()
-        return False
+        return False, None, None
 
     except Exception as e:
         logger.error(f"Gmail check error: {e}")
-        return False
+        return False, None, None
 
 
-async def process_order_auto_approval(context, order_id, user_id, amount_inr, utr_number):
-    """Try auto-approval via Gmail, fallback to admin queue"""
-    if is_utr_used(utr_number):
+async def process_order_auto_approval(context, order_id, user_id, amount_inr, user_input):
+    """Try auto-approval via Gmail. user_input can be UTR or Transaction ID."""
+    
+    # First check if this payment is already used
+    if is_payment_used(utr=user_input, transaction_id=user_input):
         try:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -393,11 +533,17 @@ async def process_order_auto_approval(context, order_id, user_id, amount_inr, ut
         return False
 
     # Check Gmail for matching payment
-    match_found = await asyncio.to_thread(check_gmail_for_payment, amount_inr, utr_number, 60)
+    match_found, extracted_utr, extracted_txn = await asyncio.to_thread(
+        check_gmail_for_payment, amount_inr, user_input, 60
+    )
 
     if match_found:
-        # Auto-approve the order
-        mark_utr_used(utr_number, user_id)
+        final_utr = extracted_utr or (user_input if user_input.isdigit() else None)
+        final_txn = extracted_txn or (user_input if not user_input.isdigit() else None)
+        
+        # Save BOTH to used_utrs
+        mark_payment_used(final_utr, final_txn, user_id)
+        
         conn = get_db()
         order = conn.execute("SELECT * FROM orders WHERE id=? AND status='awaiting_utr'", (order_id,)).fetchone()
         if order:
@@ -407,8 +553,8 @@ async def process_order_auto_approval(context, order_id, user_id, amount_inr, ut
             if acc:
                 conn.execute("UPDATE accounts SET is_sold=1,sold_to=?,sold_at=? WHERE id=?",
                              (user_id, now, acc["id"]))
-                conn.execute("UPDATE orders SET status='approved',account_id=?,utr_number=?,reviewed_by=?,reviewed_at=? WHERE id=?",
-                             (acc["id"], utr_number, 0, now, order_id))  # reviewed_by=0 means auto
+                conn.execute("UPDATE orders SET status='approved',account_id=?,utr_number=?,transaction_id=?,reviewed_by=?,reviewed_at=? WHERE id=?",
+                             (acc["id"], final_utr, final_txn, 0, now, order_id))
                 conn.execute("UPDATE users SET total_purchases=total_purchases+1 WHERE id=?", (user_id,))
                 conn.commit()
                 conn.close()
@@ -421,7 +567,7 @@ async def process_order_auto_approval(context, order_id, user_id, amount_inr, ut
                 try:
                     await context.bot.send_message(
                         chat_id=user_id,
-                        text=f"✅ *Auto-Approved!* Payment verified via UTR.\nOrder #{order_id} is now active.",
+                        text=f"✅ *Auto-Approved!* Payment verified.\nOrder #{order_id} is now active.",
                         parse_mode="Markdown",
                         reply_markup=kb
                     )
@@ -440,9 +586,11 @@ async def process_order_auto_approval(context, order_id, user_id, amount_inr, ut
                 return False
         conn.close()
     else:
-        # No match - keep in admin queue but update UTR
         conn = get_db()
-        conn.execute("UPDATE orders SET utr_number=? WHERE id=?", (utr_number, order_id))
+        if user_input.isdigit():
+            conn.execute("UPDATE orders SET utr_number=? WHERE id=?", (user_input, order_id))
+        else:
+            conn.execute("UPDATE orders SET transaction_id=? WHERE id=?", (user_input, order_id))
         conn.commit()
         conn.close()
         try:
@@ -1243,7 +1391,7 @@ async def check_crypto_order_cb(update, context):
     await query.answer(f"Status: {label}", show_alert=True)
 
 
-# ─── SCREENSHOT HANDLER (UPDATED WITH UTR FLOW) ─────────────────────────────
+# ─── SCREENSHOT HANDLER (UPDATED WITH UTR+TXN FLOW) ─────────────────────────
 async def screenshot_handler(update, context):
     if await guard(update, context):
         return
@@ -1261,7 +1409,6 @@ async def screenshot_handler(update, context):
             await update.message.reply_text("❌ Session expired.", reply_markup=main_menu_kb())
             return
         
-        # Create order with "awaiting_utr" status
         conn = get_db()
         order_id = conn.execute(
             "INSERT INTO orders (user_id,username,category_id,category_name,amount_inr,payment_method,payment_screenshot,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1270,13 +1417,11 @@ async def screenshot_handler(update, context):
         conn.commit()
         conn.close()
         
-        # Store order_id in user_data for UTR input
         context.user_data["utr_order_id"] = order_id
         context.user_data["awaiting_utr"] = True
         
-        # Also send to admin group
         admin_text = (
-            f"🔄 NEW ORDER #{order_id} (Awaiting UTR)\n"
+            f"🔄 NEW ORDER #{order_id} (Awaiting UTR/TXN)\n"
             f"User: @{user.username or 'N/A'} (ID: {user.id})\n"
             f"Category: {c['name']}\n"
             f"Amount: Rs{c['price_inr']:.0f} INR | UPI\n"
@@ -1294,9 +1439,10 @@ async def screenshot_handler(update, context):
         
         await update.message.reply_text(
             "📸 Screenshot received!\n\n"
-            "🔢 *Now enter your UTR / Transaction ID:*\n"
+            "🔢 *Now enter your UTR or Transaction ID:*\n"
             "(You'll find it in your payment app or confirmation SMS/email)\n\n"
-            "Example: `UPI1234567890` or `TXN123456789`",
+            "Example UTR: `612207806800`\n"
+            "Example Transaction ID: `FMPIB5352552758`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Order", callback_data=f"cancel_utr_{order_id}", style="danger")]])
         )
@@ -1338,8 +1484,9 @@ async def screenshot_handler(update, context):
         
         await update.message.reply_text(
             "📸 Screenshot received!\n\n"
-            "🔢 *Now enter your UTR / Transaction ID:*\n"
-            "Example: `UPI1234567890`",
+            "🔢 *Now enter your UTR or Transaction ID:*\n"
+            "Example UTR: `612207806800`\n"
+            "Example Transaction ID: `FMPIB5352552758`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="wallet", style="danger")]])
         )
@@ -1621,19 +1768,19 @@ async def check_dep_cb(update, context):
     await query.answer(f"Status: {label}", show_alert=True)
 
 
-# ─── TEXT HANDLER (UPDATED WITH UTR LOGIC) ───────────────────────────────────
+# ─── TEXT HANDLER (UPDATED WITH DUAL UTR+TXN LOGIC) ─────────────────────────
 async def text_handler(update, context):
     if await guard(update, context):
         return
     user = update.effective_user
 
-    # ── UTR INPUT FOR ORDER ──
+    # ── UTR/TXN INPUT FOR ORDER ──
     if context.user_data.get("awaiting_utr"):
         context.user_data.pop("awaiting_utr")
         order_id = context.user_data.pop("utr_order_id", None)
-        utr = update.message.text.strip()
+        user_input = update.message.text.strip()
         
-        if not utr or not order_id:
+        if not user_input or not order_id:
             await update.message.reply_text("❌ Invalid input.", reply_markup=main_menu_kb())
             return
         
@@ -1645,32 +1792,30 @@ async def text_handler(update, context):
             await update.message.reply_text("❌ Order not found or already processed.", reply_markup=main_menu_kb())
             return
         
-        await update.message.reply_text("⏳ Checking your payment via UTR... This may take a moment.")
+        await update.message.reply_text("⏳ Checking your payment... This may take a moment.")
         
-        # Try auto-approval
         approved = await process_order_auto_approval(
-            context, order_id, user.id, order["amount_inr"], utr
+            context, order_id, user.id, order["amount_inr"], user_input
         )
         
         if not approved:
-            # Send UTR update to admin group
             try:
                 await context.bot.send_message(
                     chat_id=ADMIN_GROUP_ID,
-                    text=f"ℹ️ Order #{order_id} - UTR submitted: `{utr}`\nAuto-verify failed, manual review needed.",
+                    text=f"ℹ️ Order #{order_id} - Input: `{user_input}`\nAuto-verify failed, manual review needed.",
                     parse_mode="Markdown"
                 )
             except:
                 pass
         return
 
-    # ── UTR INPUT FOR DEPOSIT ──
+    # ── UTR/TXN INPUT FOR DEPOSIT ──
     if context.user_data.get("awaiting_dep_utr"):
         context.user_data.pop("awaiting_dep_utr")
         dep_id = context.user_data.pop("utr_dep_id", None)
-        utr = update.message.text.strip()
+        user_input = update.message.text.strip()
         
-        if not utr or not dep_id:
+        if not user_input or not dep_id:
             await update.message.reply_text("❌ Invalid input.", reply_markup=main_menu_kb())
             return
         
@@ -1682,21 +1827,25 @@ async def text_handler(update, context):
             await update.message.reply_text("❌ Deposit not found or already processed.", reply_markup=main_menu_kb())
             return
         
-        await update.message.reply_text("⏳ Checking your deposit via UTR...")
+        await update.message.reply_text("⏳ Checking your deposit...")
         
-        # Check Gmail
-        if is_utr_used(utr):
-            await update.message.reply_text("❌ This UTR has already been used!", reply_markup=main_menu_kb())
+        if is_payment_used(utr=user_input, transaction_id=user_input):
+            await update.message.reply_text("❌ This UTR/Transaction ID has already been used!", reply_markup=main_menu_kb())
             return
         
-        match_found = await asyncio.to_thread(check_gmail_for_payment, dep["amount_inr"], utr, 60)
+        match_found, extracted_utr, extracted_txn = await asyncio.to_thread(
+            check_gmail_for_payment, dep["amount_inr"], user_input, 60
+        )
         
         if match_found:
-            mark_utr_used(utr, user.id)
+            final_utr = extracted_utr or (user_input if user_input.isdigit() else None)
+            final_txn = extracted_txn or (user_input if not user_input.isdigit() else None)
+            
+            mark_payment_used(final_utr, final_txn, user.id)
             conn = get_db()
             now = now_ist().isoformat()
-            conn.execute("UPDATE deposits SET status='approved',utr_number=?,reviewed_by=?,reviewed_at=? WHERE id=?",
-                        (utr, 0, now, dep_id))
+            conn.execute("UPDATE deposits SET status='approved',utr_number=?,transaction_id=?,reviewed_by=?,reviewed_at=? WHERE id=?",
+                        (final_utr, final_txn, 0, now, dep_id))
             conn.execute("UPDATE users SET wallet_balance=wallet_balance+? WHERE id=?", (dep["amount_inr"], user.id))
             conn.commit()
             conn.close()
@@ -1707,7 +1856,6 @@ async def text_handler(update, context):
                 reply_markup=main_menu_kb()
             )
             
-            # Credit referral
             ref_id, commission = credit_referral_commission(user.id, dep["amount_inr"])
             if ref_id and commission > 0:
                 try:
@@ -1719,7 +1867,10 @@ async def text_handler(update, context):
                     pass
         else:
             conn = get_db()
-            conn.execute("UPDATE deposits SET utr_number=?,status='pending' WHERE id=?", (utr, dep_id))
+            if user_input.isdigit():
+                conn.execute("UPDATE deposits SET utr_number=?,status='pending' WHERE id=?", (user_input, dep_id))
+            else:
+                conn.execute("UPDATE deposits SET transaction_id=?,status='pending' WHERE id=?", (user_input, dep_id))
             conn.commit()
             conn.close()
             await update.message.reply_text(
@@ -1729,7 +1880,7 @@ async def text_handler(update, context):
             try:
                 await context.bot.send_message(
                     chat_id=ADMIN_GROUP_ID,
-                    text=f"ℹ️ Deposit #{dep_id} - UTR: `{utr}` - Manual review needed.",
+                    text=f"ℹ️ Deposit #{dep_id} - Input: `{user_input}` - Manual review needed.",
                     parse_mode="Markdown"
                 )
             except:
@@ -2300,7 +2451,7 @@ async def _save_account_and_continue(update, context):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_stock", style="danger")]]))
 
 
-# ─── ADMIN GROUP APPROVALS ────────────────────────────────────────────────────
+# ─── ADMIN GROUP APPROVALS (UPDATED TO SAVE BOTH UTR+TXN) ───────────────────
 async def approve_order(update, context):
     query = update.callback_query
     if query.from_user.id not in ADMIN_IDS:
@@ -2321,9 +2472,10 @@ async def approve_order(update, context):
         return
     now = now_ist().isoformat()
     
-    # Mark UTR as used if exists
-    if order["utr_number"]:
-        mark_utr_used(order["utr_number"], order["user_id"])
+    utr = order["utr_number"]
+    txn = order["transaction_id"]
+    if utr or txn:
+        mark_payment_used(utr, txn, order["user_id"])
     
     conn.execute("UPDATE accounts SET is_sold=1,sold_to=?,sold_at=? WHERE id=?", (order["user_id"], now, acc["id"]))
     conn.execute("UPDATE orders SET status='approved',account_id=?,reviewed_by=?,reviewed_at=? WHERE id=?",
@@ -2393,8 +2545,10 @@ async def approve_deposit(update, context):
         conn.close()
         return
     
-    if dep["utr_number"]:
-        mark_utr_used(dep["utr_number"], dep["user_id"])
+    utr = dep["utr_number"]
+    txn = dep["transaction_id"]
+    if utr or txn:
+        mark_payment_used(utr, txn, dep["user_id"])
     
     conn.execute("UPDATE deposits SET status='approved',reviewed_by=?,reviewed_at=? WHERE id=?",
                  (query.from_user.id, now_ist().isoformat(), dep_id))
@@ -2713,13 +2867,6 @@ async def add_stock_start(update, context):
     await query.answer()
     if not is_admin(query.from_user.id):
         return
-    client = context.user_data.get("login_client")
-    if client:
-        try:
-            await client.disconnect()
-        except:
-            pass
-        context.user_data.pop("login_client", None)
     for k in ["new_cat_id","new_cat_name","new_cat_step","new_cat_quantity","new_cat_added",
               "current_phone","current_session","zip_mode"]:
         context.user_data.pop(k, None)
@@ -2782,26 +2929,7 @@ async def toggle_cat(update, context):
     conn.commit()
     conn.close()
     await query.answer("✅ Enabled" if new_v else "❌ Disabled", show_alert=True)
-    c = get_cat(cat_id)
-    stock = get_stock_count(cat_id)
-    conn2 = get_db()
-    total = conn2.execute("SELECT COUNT(*) as cnt FROM accounts WHERE category_id=?",
-                          (cat_id,)).fetchone()["cnt"]
-    conn2.close()
-    text = (
-        f"📂 *{mesc(c['name'])}*\n"
-        f"💰 ₹{c['price_inr']:.0f} INR | ${c['price_usd']:.2f} USDT\n"
-        f"📦 Available: {stock} | Total: {total}\n"
-        f"Status: {'✅ Enabled' if c['enabled'] else '❌ Disabled'}"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Set Price",        callback_data=f"setprice_cat_{cat_id}", style="primary"),
-         InlineKeyboardButton("🔛 Toggle",            callback_data=f"toggle_cat_{cat_id}", style="primary")],
-        [InlineKeyboardButton("➕ Add More Numbers",  callback_data=f"addmore_cat_{cat_id}", style="success"),
-         InlineKeyboardButton("🗑️ Delete Category",  callback_data=f"del_cat_{cat_id}", style="danger")],
-        [InlineKeyboardButton("🔙 Back",              callback_data="admin_stock", style="primary")],
-    ])
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    await admin_stock(update, context)
 
 async def del_cat(update, context):
     query = update.callback_query
@@ -2813,23 +2941,9 @@ async def del_cat(update, context):
     conn.execute("DELETE FROM stock_categories WHERE id=?", (cat_id,))
     conn.execute("DELETE FROM accounts WHERE category_id=? AND is_sold=0", (cat_id,))
     conn.commit()
-    cats  = conn.execute("SELECT * FROM stock_categories ORDER BY name").fetchall()
     conn.close()
     await query.answer("🗑️ Category deleted!", show_alert=True)
-    buttons = [[InlineKeyboardButton("➕ Add New Stock", callback_data="add_stock_start", style="success")]]
-    for c in cats:
-        stock = get_stock_count(c["id"])
-        conn2 = get_db()
-        total = conn2.execute("SELECT COUNT(*) as cnt FROM accounts WHERE category_id=?",
-                              (c["id"],)).fetchone()["cnt"]
-        conn2.close()
-        icon = "✅" if c["enabled"] else "❌"
-        buttons.append([InlineKeyboardButton(
-            f"{icon} {c['name']}  📦{stock}/{total}  ₹{c['price_inr']:.0f}",
-            callback_data=f"stock_cat_{c['id']}", style="primary")])
-    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_menu", style="primary")])
-    await query.edit_message_text("📦 *Stock Manager*", parse_mode="Markdown",
-                                  reply_markup=InlineKeyboardMarkup(buttons))
+    await admin_stock(update, context)
 
 async def remove_acc_cb(update, context):
     query = update.callback_query
@@ -2913,6 +3027,8 @@ async def admin_order_view(update, context):
     )
     if o["utr_number"]:
         text += f"\n🔢 UTR: `{o['utr_number']}`"
+    if o["transaction_id"]:
+        text += f"\n🆔 TXN ID: `{o['transaction_id']}`"
     buttons = []
     if o["status"] in ("pending", "awaiting_utr"):
         buttons.append([
@@ -3086,6 +3202,8 @@ async def admin_dep_view(update, context):
     )
     if d["utr_number"]:
         text += f"\n🔢 UTR: `{d['utr_number']}`"
+    if d["transaction_id"]:
+        text += f"\n🆔 TXN ID: `{d['transaction_id']}`"
     buttons = []
     if d["status"] in ("pending", "awaiting_utr"):
         buttons.append([
@@ -3311,7 +3429,6 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_broadcast,        pattern="^admin_broadcast$"))
     app.add_handler(CallbackQueryHandler(broadcast_confirm,      pattern="^broadcast_confirm$"))
     
-    # Redeem code admin handlers
     app.add_handler(CallbackQueryHandler(admin_redeem_codes_cb,   pattern="^admin_redeem_codes$"))
     app.add_handler(CallbackQueryHandler(admin_generate_redeem_cb, pattern="^admin_generate_redeem$"))
     app.add_handler(CallbackQueryHandler(redeem_confirm_cb,       pattern="^redeem_confirm$"))
@@ -3320,7 +3437,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL,            document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    logger.info("✅ Bot started with UPI Auto-Approval System!")
+    logger.info("✅ Bot started with Dual UTR+TXN Auto-Approval System!")
     app.run_polling(drop_pending_updates=True)
 
 
